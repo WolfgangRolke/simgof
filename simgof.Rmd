@@ -1,0 +1,1468 @@
+---
+title: Simulations for Simultaneous Goodness-of-fit Testing
+header-includes: \usepackage{color}
+                 \usepackage{float}
+output:
+  html_document: default
+  pdf_document:
+    fig_caption: no
+---
+
+
+```{r, echo=FALSE}
+if(!("simdata" %in% dir()))
+  dir.create("simdata")
+nolibraries <- FALSE
+tmp <- try(library(simgof), silent=TRUE)
+if(substring(tmp[1], 1, 5)=="Error") {
+  cat("Install library simgof from CRAN\n")
+  nolibraries <- TRUE
+} else {library(simgof)}
+library(knitr)
+library(gridExtra)
+library(cowplot)
+opts_chunk$set(echo=FALSE,
+               message=FALSE,
+               warning=FALSE,
+               error=TRUE)
+```
+
+```{r}
+if(nolibraries) {
+  knitr::exit()
+}
+```
+
+**WARNING: knitting the full Rmd will take several hours!!**
+
+## General Setup
+
+```{r}
+B <- 10000 # Number of simulation runs for null distribution
+Bpower <- 10000 # Number of simulation runs for power
+all.methods <- c("KS", "AD", "CdM", "W",   "ZK", "ZA", "ZC", "ppcc", "RGd")
+normal.methods <- c(all.methods, "SW", "JB", "sNor")
+uniform.methods <- c(all.methods, "sUnif")
+exponential.methods <- c(all.methods, "sExp")
+chisquare.methods <- c("RGd", "Equal Size", "Equal Prob")
+custom.shape <-   c(20, 1:16-1)
+```
+
+
+## R routines
+
+-  **Routine for drawing power curves**
+
+```{r}
+do.graph <- function(out, xlbl) {
+  Methods <- colnames(out)
+  xvals=case$alt.param=as.numeric(rownames(out))
+  mns <- apply(out, 2, mean)
+  ordr <- order(mns, decreasing = TRUE)
+  cs <- custom.shape[ordr]
+  m <- length(case$alt.param)
+  df <- data.frame(
+      x=rep(xvals, length(Methods)),
+      Power=c(out),
+      Method=factor(rep(Methods, each=m),
+        levels=Methods[ordr],
+        ordered=TRUE)
+  )
+df1 <- df[df$Method=="RC", ]
+plt <- ggplot(data=df, aes(x, Power , shape=Method)) +
+  geom_point() +
+  xlab(xlbl) +
+  geom_line(data=df1, aes(x, Power)) +
+  scale_shape_manual(values=cs)
+ print(plt)
+
+}
+```
+
+-  **Routine for finding power of tests**
+
+```{r}
+simgof.power <- function(case, alpha=0.05) {
+# Find distributions of test statistics under the null hypothesis
+  m <- length(case$methods)
+  znull <- matrix(0, case$B, length(case$methods))
+  colnames(znull) <- case$methods
+  param <- case$param
+  for(i in 1:case$B) {
+    case$n <- ifelse(is.null(case$lambda), case$n, rpois(1, case$lambda))
+    x <- case$rnull(case$n, param)
+    if(!is.null(case$param)) case$param <- case$est.mle(x)
+    znull[i, ] <- simgof::TS(x, case)
+  } 
+# Find p value distributions  
+  tmp <- rep(0, length(case$methods))
+  names(tmp) <- case$methods
+  pval <- rep(0, case$B)
+  for(i in 1:case$B) {
+    xsim <- znull[sample(1:case$B, 1), ]
+    for(k in case$methods) 
+      tmp[k] <- sum(xsim[k]<znull[, k])/case$B      
+    pval[i] <- min(tmp)
+  } 
+  
+# Find cdf of p values
+  x <- seq(0, 1, length=250)
+  y <- 0*x
+  for(i in 1:250) y[i] <- sum(pval<=x[i])/length(pval)
+  xy <- cbind(x, y)
+  adjust <- function(xy, a) {
+    approx(x=xy[, 1], y=xy[, 2], xout=a, rule=2)$y
+  } 
+# Find power(s)   
+  tmp <- matrix(0, length(case$alt.param), length(case$methods)+1)
+  colnames(tmp) <- c("RC", case$methods)
+  rownames(tmp) <- case$alt.param
+  reject <- as.list(seq_along(alpha))
+  for(k in seq_along(alpha))
+    reject[[k]] <- tmp
+    pvals <- rep(0, length(case$methods)+1)
+    names(pvals) <- c("RC", case$methods)
+    for(j in seq_along(case$alt.param)) {
+      ralt <- function(n)
+        case$ralt(n, case$alt.param[j])
+      for(i in 1:case$Bpower) {
+        case$n <- ifelse(is.null(case$lambda), case$n, rpois(1, case$lambda))
+        x <- ralt(case$n)
+        if(!is.null(case$param)) case$param <- case$est.mle(x)
+        tmp <- simgof::TS(x, case)
+        for(k in case$methods) {
+          pvals[k] <- sum(tmp[k]<znull[, k])/case$B
+        }
+        pvals["RC"] <- adjust(xy, min(pvals[-1]))
+        for(k in seq_along(alpha))
+          reject[[k]][j, ] <- reject[[k]][j, ] +
+              ifelse(pvals<alpha[k], 1, 0)
+      }
+  }
+  for(k in seq_along(alpha))
+      reject[[k]] <- round(100*reject[[k]]/case$Bpower, 1)
+  if(length(alpha)==1) return(reject[[1]])
+  reject
+}
+```
+
+
+-  **Routine for finding power using parallel processing**
+
+```{r}
+simgof.power.parallel <- function(case) {
+   num_cores <- parallel::detectCores()-1
+   if(num_cores==1) return(simgof.power(case))
+   cl <- parallel::makeCluster(num_cores)
+   z <- parallel::clusterCall(cl, simgof.power, case)
+   out <- 0*z[[1]]
+   for(i in 1:num_cores)
+      out <- out+z[[i]]
+   parallel::stopCluster(cl)
+   round(out/num_cores, 1)
+}
+```
+
+## Bonferroni Solution
+
+```{r}
+case <- list(
+  B = B,
+  Bpower  = Bpower,
+  param = NULL,
+  n = 1000,
+  pnull = function(x, param) pnorm(x),
+  rnull = function(n, p=c(0, 1)) rnorm(n),
+  qnull = function(p, param) qnorm(p),
+  qnull = function(p, param=NULL) qnorm(p),
+  LR = c(-Inf, Inf),
+  alt.param = 1,
+  methods = normal.methods,
+  est.mle = function(x) NA
+)
+```
+
+```{r}
+bonferroni <- function(case,
+                  alpha=c(0.01, 0.05, 0.1)) {
+  alpha <- alpha/length(case$methods)
+  znull <- matrix(0, case$B, length(case$methods))
+  colnames(znull) <- case$methods
+  for(i in 1:case$B) {
+    x <- case$rnull(case$n)
+    znull[i, ] <- simgof::TS(x, case)
+  }
+  reject <- rep(0, length(alpha))
+  for(i in 1:case$Bpower) {
+    x <- case$rnull(case$n)
+    tmp <- simgof::TS(x, case)
+    pvals <- tmp
+    for(m in case$methods)
+      pvals[m] <- sum(tmp[m]<znull[, m])
+    pvals <- pvals/case$B
+    for(k in seq_along(alpha))
+      if(any(pvals<alpha[k]))
+        reject[k] <- reject[k] + 1
+  }
+  round(100*reject/case$Bpower, 1)
+}
+```
+
+- Bonferroni
+
+```{r bonf, cache=TRUE}
+tn <- 1
+bonferroni(case)
+```
+
+
+## ANOVA example
+
+```{r anova, cache=TRUE}
+t <- 1
+k <- 5
+pvals <- rep(0, B)
+for(i in 1:B) {
+  x <- rnorm(100)
+  y <- sample(1:k, 100, replace = TRUE)
+  tmp <- NULL
+  for(j in 1:(k-1)) {
+    for(m in (j+1):k)
+      tmp <- c(tmp, t.test(x[y==j], x[y==m])$p.value)
+  }
+  pvals[i] <- min(tmp)
+}
+x <- seq(0, 1, length=250)
+y <- x
+for(i in 1:250) y[i] <- sum(pvals<x[i])/B
+tpvals <- approx(x, y, pvals)$y
+df <- data.frame(pvals, tpvals)
+c(sum(tpvals<0.01), sum(tpvals<0.05), sum(tpvals<0.1))/B
+df1 <- data.frame(x=rep(x, 3), 
+  y=c(y, y2=1-(1-x)^10, y3=x),
+  which=rep(c("ECDF", "Indep.", "No adjust."), each=250)
+)
+```
+
+
+```{r}
+bw <- 1/50 
+plt1 <- ggplot(df, aes(pvals)) +
+  geom_histogram(aes(y = ..density..),
+    color = "black", 
+    fill = "white", 
+    binwidth = bw) +
+    labs(x="p value", y="")
+plt2 <- ggplot(data=df1, aes(x, y, group=which)) +
+  geom_line(aes(linetype=which)) +
+  scale_linetype_manual(values=c("solid", "dotted", "twodash")) +
+  labs(x="p", y="") +
+  theme(legend.title = element_blank())
+plt3 <- ggplot(df, aes(tpvals)) +
+  geom_histogram(aes(y = ..density..),
+    color = "black", 
+    fill = "white", 
+    binwidth = bw) +
+    labs(x="Transformed p value", y="")
+```  
+
+```{r}
+plt5 <- plot_grid(plt1, plt2, plt3, nrow=2)
+plt5
+#save_plot("figANOVA.pdf", plt5)
+```
+
+## Null distributions
+
+-  N(0,1)
+
+```{r}
+case <- list(
+  B = B,
+  Bpower = Bpower,
+  param = NULL,
+  n = 1000,
+  pnull = function(x, param) pnorm(x),
+  rnull = function(n, p=NULL) rnorm(n),
+  qnull = function(p, param) qnorm(p),
+  ralt = function(n, p=NULL) rnorm(n),
+  LR = c(-Inf, Inf),
+  alt.param = 1,
+  methods = normal.methods,
+  est.mle = function(x) NA
+)
+```
+
+
+```{r case01, cache=TRUE}
+tn <- 2
+out <- NULL
+n <- c(100, 500, 1000)
+for(i in n) {
+  case$n <- i
+  z <- simgof.power(case, alpha=c(0.01, 0.05, 0.1))
+  out <- rbind(out,
+      c(z[[1]][1], z[[2]][1], z[[3]][1]))
+}
+colnames(out) <- c("1%", "5%", "10%")
+rownames(out) <-
+  paste0("N(0,1),n=", c(100, 500, 1000))
+```
+
+- Normal, mean and sd estimated
+
+```{r case02, cache=TRUE}
+tn <- 2
+case$param = c(0, 1)
+case$pnull = function(x, param)
+    pnorm(x, param[1], param[2])
+case$qnull = function(x, param=c(0,1))
+    qnorm(x, param[1], param[2])
+case$rnull = function(n, param=c(0,1))
+    rnorm(n, param[1], param[2])
+case$ralt = function(n, param=c(0,1)) rnorm(n)
+case$est.mle = function(x) c(mean(x), sd(x))
+n <- c(100, 500, 1000)
+for(i in n) {
+  case$n <- i
+  z <- simgof.power(case, alpha=c(0.01, 0.05, 0.1))
+  out <- rbind(out,
+      c(z[[1]][1], z[[2]][1], z[[3]][1]))
+}
+rownames(out)[nrow(out)-2:0] <-
+  paste0("N,n=", c(100, 500, 1000))
+```
+
+```{r}
+n.out <- out
+```
+
+
+- U[0,1]
+
+```{r}
+case$methods <- uniform.methods
+out <- NULL
+```
+
+
+```{r case03, cache=TRUE}
+tn <- 2
+out <- NULL
+case$param = NULL
+case$pnull = function(x, param) punif(x)
+case$rnull = function(n, p=NULL) runif(n)
+case$ralt = case$rnull
+case$qnull = function(p, param) qunif(p)
+case$LR = c(0, 1)
+case$est.mle = function(x) NULL
+n <- c(100, 500, 1000)
+for(i in n) {
+  case$n <- i
+  z <- simgof.power(case, alpha=c(0.01, 0.05, 0.1))
+  out <- rbind(out,
+      c(z[[1]][1], z[[2]][1], z[[3]][1]))
+}
+rownames(out)[nrow(out)-2:0] <-
+  paste0("U[0,1],n=", c(100, 500, 1000))
+```
+
+```{r}
+u.out <- out
+```
+
+- Exponential(1)
+
+```{r}
+case$methods <- exponential.methods
+out <- NULL
+```
+
+
+```{r case04, cache=TRUE}
+tn <- 1
+case$param = NULL
+case$pnull = function(x, param) pexp(x, 1)
+case$rnull = function(n, p=1) rexp(n, 1)
+case$ralt = case$rnull
+case$qnull = function(p, param) qexp(p, 1)
+case$LR = c(0, Inf)
+case$est.mle = function(x) NULL
+n <- c(100, 500, 1000)
+for(i in n) {
+  case$n <- i
+  z <- simgof.power(case, alpha=c(0.01, 0.05, 0.1))
+  out <- rbind(out,
+      c(z[[1]][1], z[[2]][1], z[[3]][1]))
+}
+rownames(out)[nrow(out)-2:0] <-
+  paste0("Exp(1),n=", c(100, 500, 1000))
+```
+
+- Exponential, rate estimated
+
+```{r case05, cache=TRUE}
+tn <- 1
+case$param = 1
+case$pnull = function(x, param)
+  pexp(x, param)
+case$rnull = function(n, p=1) rexp(n, p)
+case$ralt = case$rnull
+case$qnull = function(p, param=1) qexp(p, param)
+case$LR = c(0, Inf)
+case$est.mle = function(x) 1/mean(x)
+n <- c(100, 500, 1000)
+for(i in n) {
+  case$n <- i
+  z <- simgof.power(case, alpha=c(0.01, 0.05, 0.1))
+  out <- rbind(out,
+      c(z[[1]][1], z[[2]][1], z[[3]][1]))
+}
+rownames(out)[nrow(out)-2:0] <-
+  paste0("Exp,n=", c(100, 500, 1000))
+```
+
+```{r}
+case$methods <- all.methods
+```
+
+- Beta(3, 1/2)
+
+```{r case06, cache=TRUE}
+tn <- 2
+case$param = NULL
+case$pnull = function(x, param)
+  pbeta(x, 3, 1/2)
+case$rnull = function(n, p=NULL) rbeta(n, 3, 1/2)
+case$ralt = case$rnull
+case$qnull = function(p, param) qbeta(p, 3, 1/2)
+case$LR = c(0, 1)
+case$est.mle = function(x) NULL
+n <- c(100, 500, 1000)
+for(i in n) {
+  case$n <- i
+  z <- simgof.power(case, alpha=c(0.01, 0.05, 0.1))
+  out <- rbind(out,
+      c(z[[1]][1], z[[2]][1], z[[3]][1]))
+}
+rownames(out)[nrow(out)-2:0] <-
+  paste0("Beta(3, 0.5),n=", c(100, 500, 1000))
+```
+
+- Gamma(3, 2)
+
+```{r case07, cache=TRUE}
+tn <- 2
+case$param = NULL
+case$pnull = function(x, param) pgamma(x, 3, 2)
+case$rnull = function(n, p=NULL) rgamma(n, 3, 2)
+case$ralt = case$rnull
+case$qnull = function(p, param) qgamma(p, 3, 2)
+case$LR = c(0, Inf)
+case$est.mle = function(x) NULL
+n <- c(100, 500, 1000)
+for(i in n) {
+  case$n <- i
+  z <- simgof.power(case, alpha=c(0.01, 0.05, 0.1))
+  out <- rbind(out,
+      c(z[[1]][1], z[[2]][1], z[[3]][1]))
+}
+rownames(out)[nrow(out)-2:0] <-
+  paste0("Gamma(3, 2),n=", c(100, 500, 1000))
+```
+
+
+```{r}
+out <- rbind(n.out, u.out,  out)
+colnames(out) <- c("1%", "5%", "10%")
+df <- data.frame(
+  Distribution=c(rep("Normal", 6), rep("Uniform", 3),
+                 rep("Exponential", 6), rep("Beta", 3),
+                 rep("Gamma", 3)),
+  Parameter=c(rep("Fixed", 3), rep("Estimated", 3),
+              rep("Fixed", 6), rep("Estimated", 3),
+              rep("Fixed", 6)
+              ),
+  SampleSize = rep(c(100, 500, 1000), each=7),
+  out)
+colnames(df)[4:6] <- c("1%", "5%", "10%")
+df
+saveRDS(df, "simdata/nulltable.rds")
+df
+```
+
+## Power
+
+### Case 0, Normal vs t(df)
+
+```{r}
+case <- list(
+  methods = normal.methods,
+  param = c(0, 1),
+  B = B,
+  Bpower  = Bpower,
+  n = 1000,
+  pnull = function(x, param=c(0,1))
+    pnorm(x, param[1], param[2]),
+  rnull = function(n, p=c(0, 1))
+    rnorm(n, p[1], p[2]),
+  qnull = function(p, param=c(0,1))
+    qnorm(p, param[1], param[2]),
+  alt.param = 3*1:20,
+  ralt = function(n, p=c(0,1)) rt(n, p),
+  est.mle = function(x) c(mean(x), sd(x)),
+  LR = c(-Inf, Inf)
+)
+```
+
+
+```{r case0, cache=TRUE}
+tn <- 1
+out <- simgof.power.parallel(case)
+```
+
+```{r}
+saveRDS(list(out=out, varname="Degrees of Freedom"), "simdata/case0.rds")
+do.graph(out, "Degrees of Freedom")
+all.normal.cases <- out
+```
+
+
+### Case 1: Normal(0,1) vs t(df)
+
+```{r}
+case <- list(
+  methods = normal.methods,
+  param = NULL,
+  B = B,
+  Bpower  = Bpower,
+  n = 1000, # sample size
+  pnull = function(x, param) pnorm(x),
+  rnull = function(n, p=c(0, 1)) rnorm(n),
+  qnull = function(p, param) qnorm(p),
+  alt.param = 3*1:20,
+  ralt = function(n, p) rt(n, p),
+  est.mle = function(x) NULL,
+  LR = c(-Inf, Inf)
+)
+```
+
+```{r case1, cache=TRUE}
+tn <- 1
+out <- simgof.power.parallel(case)
+```
+
+
+```{r}
+saveRDS(list(out=out, varname="Degrees of Freedom"), "simdata/case1.rds")
+do.graph(out, "Degrees of Freedom")
+all.normal.cases <- rbind(all.normal.cases, out)
+```
+
+### Case 2, Normal vs Beta(q, q)
+
+```{r}
+case <- list(
+  methods = normal.methods,
+  param = c(0.5, 0.1),
+  B = B,
+  Bpower  = Bpower,
+  n = 1000,
+  pnull = function(x, param=c(0.5, 0.1))
+    pnorm(x, param[1], param[2]),
+  rnull = function(n, p=c(0.5, 0.1))
+    rnorm(n, p[1], p[2]),
+  qnull = function(p, param=c(0.5, 0.1))
+    qnorm(p, param[1], param[2]),
+  alt.param = 4:23,
+  ralt = function(n, q=1) rbeta(n, q, q),
+  est.mle = function(x) c(mean(x), sd(x)),
+  LR = c(-Inf, Inf)
+)
+```
+
+
+```{r case2, cache=TRUE}
+tn <- 2
+out <- simgof.power.parallel(case)
+```
+
+```{r}
+saveRDS(list(out=out, varname="q"), "simdata/case2.rds")
+do.graph(out, "q")
+all.normal.cases <- rbind(all.normal.cases, out)
+```
+
+
+### Case 3: Normal(r, $\sqrt{r}$) vs Gamma(r, 1)
+
+```{r}
+case <- list(
+  methods = normal.methods,
+  param = NULL,
+  B = B,
+  Bpower  = Bpower,
+  n = 1000, # sample size
+  qnull=0,
+  est.mle = function(x) NULL,
+  LR = c(-Inf, Inf)
+)
+```
+
+
+```{r case3, cache=TRUE}
+tn <- 1
+out <- matrix(0, 20, length(case$methods)+1)
+r <- 10*1:20
+rownames(out) <- paste("r =", r)
+colnames(out) <- c("RC", case$methods)
+for(i in 1:20) {
+  case$alt.param <- r[i]
+  case$pnull <- function(x, param)
+    pnorm(x, r[i], sqrt(r[i]))
+  case$qnull <- function(p, param) qnorm(p, r[i], sqrt(r[i]))
+  case$rnull <- function(n, p=1) rnorm(n, r[i], sqrt(r[i]))
+  case$ralt <- function(n, r) rgamma(n, r, 1)
+  out[i, ] <- simgof.power(case)
+}
+```
+
+
+```{r}
+rownames(out) <- 10*1:20
+case$alt.param <- 10*1:20
+saveRDS(list(out=out, varname="r"), "simdata/case3.rds")
+do.graph(out, "r")
+all.normal.cases <- rbind(all.normal.cases, out)
+```
+
+### Case 4: Normal vs Gamma(r, 1)
+
+```{r}
+case <- list(
+  param = 0,
+  methods = normal.methods,
+  B = B,
+  Bpower  = Bpower,
+  n = 1000, # sample size
+  qnull=0,
+  alt.param = 1,
+  est.mle = function(x) mean(x),
+  LR = c(-Inf, Inf)
+)
+```
+
+
+```{r case4, cache=TRUE}
+tn <- 2
+out <- matrix(0, 20, length(case$methods)+1)
+rownames(out) <- paste("r =", r)
+colnames(out) <- c("RC", case$methods)
+r <-  10*1:20
+for(i in 1:20) {
+  case$param <- r[i]
+  case$pnull <-  function(x, param=r[i])
+    pnorm(x, param, sqrt(param))
+  case$qnull <- function(p, param=r[i])
+    qnorm(p, param, sqrt(param))
+  case$rnull <- function(n, p=r[i])
+    rnorm(n, p, sqrt(p))
+  case$ralt <- function(n, p)
+    rgamma(n, r[i], 1)
+  out[i, ] <- simgof.power(case)
+}
+```
+
+
+
+```{r}
+rownames(out) <- r
+case$alt.param <- r
+saveRDS(list(out=out, varname="r"), "simdata/case4.rds")
+do.graph(out, "r")
+all.normal.cases <- rbind(all.normal.cases, out)
+```
+
+## Performance with H~0~: Normal
+
+```{r PerformanceNormal}
+round(sort(apply(all.normal.cases, 2, mean)), 1)
+```
+
+### Case 5: Uniform[0,1] vs Linear
+
+```{r}
+case <- list(
+  param = NULL,
+  methods = uniform.methods,
+  B = B,
+  Bpower  = Bpower,
+  n = 1000, # sample size
+  pnull = function(x, param)  punif(x),
+  rnull = function(n, p=1) runif(n),
+  qnull = function(p, param) qunif(p),
+  alt.param = round(seq(0, 0.3, length=20), 2),
+  ralt = function(n, slope) {
+    if (slope == 0)
+        return(runif(n))
+    (slope - 1 + sqrt((1 - slope)^2 +
+              4 * slope * runif(n)))/2/slope
+  },
+  est.mle = function(x) NULL,
+  LR = c(0, 1)
+)
+```
+
+
+```{r case5, cache=TRUE}
+tn <- 1
+out <- simgof.power.parallel(case)
+```
+
+```{r}
+saveRDS(list(out=out, varname="Slope"), "simdata/case5.rds")
+do.graph(out, "Slope")
+all.uniform.cases <- out
+```
+
+
+### Case 6: Uniform[0,1] vs Beta(1, q)
+
+```{r}
+case <- list(
+  param = NULL,
+  methods = uniform.methods,
+  est.mle = function(x) NULL,
+  B = B,
+  Bpower  = Bpower,
+  n = 1000, # sample size
+  pnull = function(x, param)  punif(x),
+  rnull = function(n, p=1) runif(n),
+  qnull = function(p, param) qunif(p),
+  alt.param = sort(c(1, seq(0.8, 1.2, length=19))),
+  ralt = function(n, p) rbeta(n, 1, p),
+  LR = c(0, 1)
+)
+```
+
+
+```{r case6, cache=TRUE}
+tn <- 1
+out <- simgof.power.parallel(case)
+```
+
+
+```{r}
+saveRDS(list(out=out, varname="q"), "simdata/case6.rds")
+do.graph(out, "q")
+all.uniform.cases <- rbind(all.uniform.cases, out)
+```
+
+
+### Case 7: Uniform[0,1] vs Beta(q, q)
+
+```{r}
+case <- list(
+  param = NULL,
+  methods = uniform.methods,
+  est.mle = function(x) NULL,
+  B = B,
+  Bpower  = Bpower,
+  n = 1000, # sample size
+  pnull = function(x, param)  punif(x),
+  rnull = function(n, p=1) runif(n),
+  qnull = function(p, param) qunif(p),
+  alt.param = sort(c(1, seq(0.8, 1.2, length=19))),
+  ralt = function(n, p) rbeta(n, p, p),
+  LR = c(0, 1)
+)
+```
+
+
+
+```{r case7, cache=TRUE}
+tn <- 1
+out <- simgof.power.parallel(case)
+```
+
+
+```{r}
+saveRDS(list(out=out, varname="q"), "simdata/case7.rds")
+do.graph(out, "q")
+all.uniform.cases <- rbind(all.uniform.cases, out)
+```
+
+### Case 8: Uniform[0,1] vs Quadratic
+
+
+```{r}
+case <- list(
+  param = NULL,
+  methods = uniform.methods,
+  est.mle = function(x) NULL,
+  B = 1000,
+  Bpower  = Bpower,
+  n = 1000, # sample size
+  pnull = function(x, param)  punif(x),
+  rnull = function(n, p=1) runif(n),
+  qnull = function(p, param) qunif(p),
+  alt.param = round(sort(c(0, seq(-1, 1, length=19))), 2),
+  ralt = function(n, a)  {
+    dquad <- function(x) 3*a*(x-0.5)^2+1-a/4
+    if(a==0) return(runif(n))
+    cc <- ifelse(a>0, dquad(0), dquad(0.5))
+    y <- rep(0, n)
+    for(i in 1:n) {
+      repeat {
+        u <- runif(1)
+        if(runif(1)<dquad(u)/cc) {y[i]<-u;break}
+      }
+    }
+    y
+  },
+  LR = c(0, 1)
+)
+```
+
+
+
+```{r case8, cache=TRUE}
+tn <- 2
+out <- simgof.power.parallel(case)
+```
+
+
+```{r}
+saveRDS(list(out=out, varname="a"), "simdata/case8.rds")
+do.graph(out, "a")
+all.uniform.cases <- rbind(all.uniform.cases, out)
+```
+
+
+## Performance with H~0~: Uniform
+
+```{r PerformanceUniform}
+round(sort(apply(all.uniform.cases, 2, mean)), 1)
+```
+
+
+
+### Case 9: Exponential  vs Exponential(1)+Normal(1.5, sigma)
+
+
+```{r}
+case <- list(
+  param = 1,
+  methods = exponential.methods,
+  B = B,
+  Bpower  = Bpower,
+  n = 1000, # sample size
+  dnull = function(x, param) dexp(x, param),
+  pnull = function(x, param) pexp(x, param),
+  rnull = function(n, p=1) rexp(n, 1),
+  qnull = function(p, param) qexp(p, 1),
+  alt.param = round(seq(1, 0.3, length=20), 2),
+  ralt = function(n, p) {
+    z <- sample(0:1, n, replace = TRUE, prob=c(9, 1))
+    y <- rnorm(10*n, 1.5, p)
+    y <- y[y>0][1:n]
+    ifelse(z==0, rexp(n, 1), y)
+  },
+  est.mle = function(x) 1/mean(x),
+  LR = c(0, Inf)
+)
+```
+
+```{r case9, cache=TRUE}
+tn <- 1
+out <- simgof.power.parallel(case)
+```
+
+
+```{r}
+saveRDS(list(out=out, varname="sd"), "simdata/case9.rds")
+do.graph(out, "sd")
+all.expo.cases <- out
+```
+
+### Case 10: Exponential(1) vs Gamma(p, 1)
+
+```{r}
+case <- list(
+  param = NULL,
+  methods = exponential.methods,
+  B = B,
+  Bpower  = Bpower,
+  n = 1000, # sample size
+  pnull = function(x, param=1) pexp(x, 1),
+  rnull = function(n,p=1) rexp(n, 1),
+  qnull = function(p, param=1) qexp(p, 1),
+  alt.param = sort(c(1, seq(0.8, 1.2, length=19))),
+  ralt = function(n, p) rgamma(n, p, 1),
+  est.mle = function(x) NULL,
+  LR = c(0, Inf)
+)
+```
+
+
+
+```{r case10, cache=TRUE}
+tn <- 1
+out <- simgof.power.parallel(case)
+```
+
+
+```{r}
+saveRDS(list(out=out, varname="p"), "simdata/case10.rds")
+do.graph(out, "p")
+all.expo.cases <- rbind(all.expo.cases, out)
+```
+
+
+### Case 11: Exponential vs Gamma(p, 1)
+
+```{r}
+case <- list(
+  param = 1,
+  methods = exponential.methods,
+  B = B,
+  Bpower  = Bpower,
+  n = 1000, # sample size
+  pnull = function(x, param=1) pexp(x, param),
+  rnull = function(n,p=1) rexp(n, p),
+  qnull = function(p, param=1) qexp(p, param),
+  alt.param = sort(c(1, seq(0.8, 1.2, length=19))),
+  ralt = function(n, p) rgamma(n, p, 1),
+  est.mle = function(x) 1/mean(x),
+  LR = c(0, Inf)
+)
+```
+
+
+
+```{r case11, cache=TRUE}
+tn <-1
+out <- simgof.power.parallel(case)
+```
+
+
+```{r}
+saveRDS(list(out=out, varname="p"), "simdata/case11.rds")
+do.graph(out, "p")
+all.expo.cases <- rbind(all.expo.cases, out)
+```
+
+### Case 12: Exponential vs Inverse Power
+
+```{r}
+case <- list(
+  param = 1,
+  methods = exponential.methods,
+  B = B,
+  Bpower  = Bpower,
+  n = 1000, # sample size
+  pnull = function(x, param=1) pexp(x, param),
+  rnull = function(n,p=1) rexp(n, p),
+  qnull = function(p, param=1) qexp(p, param),
+  alt.param = round(seq(5, 30, length=20), 1),
+  ralt = function(n, p) {
+    y=runif(2*n)^(-1/(p-1))-1
+    y[y<10][1:n]
+  },
+  est.mle = function(x) 1/mean(x),
+  LR = c(0, Inf)
+)
+```
+
+
+```{r case12, cache=TRUE}
+tn <- 2
+out <- simgof.power.parallel(case)
+```
+
+
+```{r}
+saveRDS(list(out=out, varname="a"), "simdata/case12.rds")
+saveRDS(out, "simdata/case13.rds")
+do.graph(out, "a")
+all.expo.cases <- rbind(all.expo.cases, out)
+```
+
+
+
+## Performance with H~0~: Exponential
+
+```{r PerformanceExponential}
+round(sort(apply(all.expo.cases, 2, mean)), 1)
+```
+
+
+### Case 13: Truncated Exponential(0.5, 0, 1) vs Linear(p)
+
+```{r}
+case <- list(
+  param = NULL,
+  methods = all.methods,
+  est.mle = function(x) NULL,
+  B = B,
+  Bpower  = Bpower,
+  n = 1000, # sample size
+  pnull = function(x, param=0.5) {
+    y <- (1 - exp(-0.5*x))/(1 - exp(-0.5))
+    y[y<0] <- 0;y[y>1]<-1
+    y
+  },
+  rnull = function(n, p=0.5) {
+    x <- NULL
+    repeat {
+        x <- c(x, rexp(n, 0.5))
+        x <- x[x < 1]
+        if (length(x) > n)
+            break
+    }
+    x[1:n]
+  },
+  qnull = function(p, param=0.5)
+    -log(1 - p*(1 - exp(-0.5)))/0.5,
+  alt.param = seq(-0.25, -0.55, length=20),
+  ralt = function(n, slope) {
+    if (slope == 0)
+        return(runif(n))
+    (slope - 1 + sqrt((1 - slope)^2 +
+                        4 * slope * runif(n)))/2/slope
+  },
+  LR = c(0, 1)
+)
+```
+
+```{r case13, cache=TRUE}
+tn <- 2
+out <- simgof.power.parallel(case)
+```
+
+
+```{r}
+saveRDS(list(out=out, varname="Slope"), "simdata/case13.rds")
+do.graph(out, "Slope")
+all.cases <-  out
+```
+
+
+
+### Case 14: Truncated Exponential(., 0, 1) vs Linear(p)
+
+```{r}
+case <- list(
+  param = 0.5,
+  methods = all.methods,
+  B = B,
+  Bpower  = Bpower,
+  n = 1000, # sample size
+  pnull = function(x, param=0.5) {
+    y <- (1 - exp(-0.5*x))/(1 - exp(-0.5))
+    y[y<0] <- 0;y[y>1]<-1
+    y
+  },
+  rnull = function(n, p=0.5) {
+    x <- NULL
+    repeat {
+        x <- c(x, rexp(n, p))
+        x <- x[x < 1]
+        if (length(x) > n)
+            break
+    }
+    x[1:n]
+  },
+  qnull = function(p, param=0.5)
+    -log(1 - p*(1 - exp(-param)))/param,
+  alt.param = seq(-0.2, -0.95, length=20),
+  ralt = function(n, slope) {
+    if (slope == 0)
+        return(runif(n))
+    (slope - 1 + sqrt((1 - slope)^2 +
+                        4 * slope * runif(n)))/2/slope
+  },
+  est.mle = function (x, A = 0, B = 1)
+  {
+    n <- length(x)
+    s <- sum(x)
+    p <- n/s
+    repeat {
+        o <- p
+        tmp1 <- exp(-o * A) - exp(-o * B)
+        tmp2 <- B * exp(-o * B) - A * exp(-o * A)
+        tmp3 <- A^2 * exp(-o * A) - B^2 * exp(-o * B)
+        l1 <- n/o - s - n * tmp2/tmp1
+        l2 <- (-n/o^2 - n * (tmp3 * tmp1 - tmp2^2)/tmp1^2)
+        p <- o - l1/l2
+        if (abs(p - o) < 0.001)
+            break
+    }
+    p
+  },
+  LR = c(0, 1)
+)
+```
+
+```{r case14, cache=TRUE}
+tn <- 2
+out <- simgof.power.parallel(case)
+```
+
+
+```{r}
+saveRDS(list(out=out, varname="Slope"), "simdata/case14.rds")
+do.graph(out, "Slope")
+all.cases <- rbind(all.cases, out)
+```
+
+
+### Case 15: Beta(2, 2), vs Beta(2, 2, p)
+
+
+```{r}
+case <- list(
+  param = NULL,
+  methods = all.methods,
+  est.mle = function(x) NULL,
+  B = B,
+  Bpower  = Bpower,
+  n = 1000, # sample size,
+  pnull = function(x, param)
+    pbeta(x, 2, 2),
+  rnull = function(n, p=c(2, 2))
+    rbeta(n, 2, 2),
+  qnull = function(p, param)
+     qbeta(p, 2, 2),
+  alt.param = seq(0, 0.75, length=20),
+  ralt = function(n, p) rbeta(n, 2, 2, ncp=p),
+  est.mle = function(x) NULL,
+  LR = c(0, 1)
+)
+```
+
+
+
+```{r case15, cache=TRUE}
+tn <- 1
+out <- simgof.power.parallel(case)
+```
+
+
+```{r}
+saveRDS(list(out=out, varname="ncp"), "simdata/case15.rds")
+do.graph(out, "ncp")
+all.cases <- rbind(all.cases, out)
+```
+
+### Case 16: Beta(1, .), vs Linear(a)
+
+
+```{r}
+case <- list(
+  param = 1,
+  methods = all.methods,
+  B = B,
+  Bpower  = Bpower,
+  n = 1000, # sample size,
+  pnull = function(x, param=1)
+    pbeta(x, 1, param),
+  rnull = function(n, p=1)
+    rbeta(n, 1, p),
+  qnull = function(p, param=1)
+     qbeta(p, 1, param),
+  alt.param = seq(0, -0.7, length=20),
+  ralt = function (n, slope) {
+    if (slope == 0)
+        return(runif(n))
+    (slope - 1 + sqrt((1 - slope)^2 +
+                4 * slope * runif(n)))/2/slope
+  },
+  est.mle = function(x) -1/mean(log(1-x)),
+  LR = c(0, 1)
+)
+```
+
+
+```{r case16, cache=TRUE}
+tn <- 2
+out <- simgof.power.parallel(case)
+```
+
+
+```{r}
+saveRDS(list(out=out, varname="Slope"), "simdata/case16.rds")
+do.graph(out, "Slope")
+all.cases <- rbind(all.cases, out)
+```
+
+### Case 17: Erlang(.,.) vs Gamma($\alpha, 5$)
+
+uses a non-mle estimator for k and $\lambda$.
+
+```{r}
+est.mm <- function(x, p=case$param) {
+  c(round(mean(x)^2/var(x)), mean(x)/var(x))
+}
+```
+
+
+```{r}
+case <- list(
+  param = c(2, 5),
+  methods = all.methods,
+  B = B,
+  Bpower  = Bpower,
+  n = 1000, # sample size,
+  pnull = function(x, param)
+    pgamma(x, 2, 5),
+  rnull = function(n, p=c(2, 5))
+    rgamma(n, 2, 5),
+  qnull = function(p, param)
+     qgamma(p, 2, 5),
+  alt.param = seq(1.75, 2.25, length=20),
+  ralt = function(n, p) rgamma(n, p, 5),
+  est.mle = est.mm,
+  LR = c(0, Inf)
+)
+```
+
+
+```{r case17, cache=TRUE}
+tn <- 1
+out <- simgof.power.parallel(case)
+```
+
+
+```{r}
+saveRDS(list(out=out, varname="alpha"), "simdata/case17.rds")
+do.graph(out, "alpha")
+all.cases <- rbind(all.cases, out)
+```
+
+### Case 18: Uniform[0,1] vs Beta(1, q), binned data
+
+
+```{r}
+case <- list(
+  param = NULL,
+  methods = uniform.methods,
+  est.mle = function(x) NULL,
+  B = B,
+  Bpower  = Bpower,
+  n = 1000, # sample size
+  pnull = function(x, param) punif(x),
+  rnull = function(n, p=1) runif(n),
+  qnull = function(p, param) qunif(p),
+  alt.param = sort(c(1, seq(0.8, 1.2, length=19))),
+  ralt = function(n, p) {
+    bins=seq(0,1,length=51)
+    mid=(bins[-1]+bins[-51])/2
+    p=diff(pbeta(bins, 1, p))
+    x=sample(mid, size=n, replace = TRUE, prob = p)
+    list(bins=bins,
+         counts=hist(x, bins, plot=FALSE)$counts)
+  },
+  LR = c(0, 1)
+)
+```
+
+```{r case18, cache=TRUE}
+tn <- 1
+out <- simgof.power.parallel(case)
+```
+
+
+```{r}
+saveRDS(list(out=out, varname="q"), "simdata/case18.rds")
+do.graph(out, "q")
+```
+
+### Case 19: Normal vs t(n), binned data
+
+
+```{r}
+case <- list(
+  methods = normal.methods,
+  param = c(0, 1),
+  B = B,
+  Bpower  = Bpower,
+  n = 1000,
+  pnull = function(x, param=c(0,1))
+    pnorm(x, param[1], param[2]),
+  rnull = function(n, p=c(0, 1))
+    rnorm(n, p[1], p[2]),
+  qnull = function(p, param=c(0,1))
+    qnorm(p, param[1], param[2]),
+  alt.param = 3*1:20,
+  ralt = function(n, p) {
+    bins= seq(-3, 3, length=51)
+    mid=(bins[-1]+bins[-51])/2
+    pb=c(pt(bins[2], p),
+        diff(pt(bins[2:50], p)),
+        1-pt(bins[50], p))
+    x=sample(mid, size=n, replace = TRUE, prob = pb)
+    list(bins=bins,
+         counts=hist(x, bins, plot=FALSE)$counts)
+  },
+  est.mle = function(x) c(mean(x), sd(x)),
+  LR = c(-Inf, Inf)
+)
+```
+
+
+```{r case19, cache=TRUE}
+tn <- 1
+out <- simgof.power.parallel(case)
+```
+
+
+```{r}
+saveRDS(list(out=out, varname="Degrees of Freedom"), "simdata/case19.rds")
+do.graph(out, "Degrees of Freedom")
+```
+
+### Case 20: Uniform[0,1] vs Beta(1, q), Poisson sample size
+
+
+```{r}
+case <- list(
+  param = NULL,
+  methods = uniform.methods,
+  est.mle = function(x) NULL,
+  B = B,
+  Bpower  = Bpower,
+  n = 1000, # sample size
+  pnull = function(x, param) punif(x),
+  rnull = function(n, p=1) runif(n),
+  qnull = function(p, param) qunif(p),
+  alt.param = sort(c(1, seq(0.8, 1.2, length=19))),
+  ralt = function(n, p) rbeta(n, 1, p),
+  lambda = 1000,
+  LR = c(0, 1)
+)
+```
+
+```{r case20, cache=TRUE}
+tn <- 2
+out <- simgof.power.parallel(case)
+```
+
+
+```{r}
+saveRDS(list(out=out, varname="q"), "simdata/case20.rds")
+do.graph(out, "q")
+```
+
+### Create Tables and Graphs
+
+```{r}
+for(i in 0:0) {
+  out <- readRDS(paste0("../simdata/case", i, ".rds"))[[1]]
+  mt <- apply(out, 2, mean)
+  m <- colnames(out)[order(mt, decreasing = TRUE)]
+  cat("Case ", i, "\n", 
+      paste0(m[1:(length(m)-2)],", "), 
+      m[length(m)-1], " and ", m[length(m)], ".\n")
+}
+```
+
+
+1. **Power Curves**
+
+```{r eval=FALSE}
+for(i in 0:20) {
+  print(paste("Case", i))
+  out <- readRDS(paste0("../simdata/case", i, ".rds"))
+  print(do.graph(out))
+  ggsave(paste0("figCase", i, ".pdf"))
+}  
+```
+
+
+2. **Results**
+
+```{r}
+mt <- c("RC", all.methods)
+out <- NULL
+for(i in 0:17) {
+  tmp <- readRDS(paste0("../simdata/case",i,".rds"))[[1]]
+  out <- rbind(out, tmp[, mt])
+}  
+all.cases <- out
+all.cases <- as.matrix(all.cases)
+cat("Mean Power Overall\n")
+mn <- apply(all.cases, 2, mean)
+round(sort(mn, decreasing = TRUE), 2)
+cat("Mean Power and  Ranks by case\n")
+rnks <- matrix(0, 18, 10)
+mns <- matrix(0, 18, 10)
+for(i in 0:17) {
+  tmp <- readRDS(paste0("../simdata/case", i, ".rds"))[[1]][, mt]
+  tmp1 <- apply(tmp, 2, mean)
+  mns[i+1, ] <- tmp1
+  rnks[i+1, ] <- round(rank(tmp1))
+}
+colnames(mns) <- mt
+colnames(rnks) <- mt
+mt <- colnames(all.cases)[order(mn, decreasing = TRUE)]
+mns <- mns[, mt]
+rnks <- rnks[, mt]
+rownames(rnks)=paste("Case",1:18)
+rnks1 = 10-rnks
+kable.nice(rnks1)
+cat("Mean Ranks\n")
+round(sort(apply(rnks1, 2, mean)),1)
+tmp <- matrix(0, 10, 10)
+colnames(tmp) <- colnames(rnks)
+row.names(tmp) <- 1:10
+bins=seq(0.5, 10.5, 1)
+for(i in 1:10) { 
+  tmp[, i]  <- hist(rnks[, i], bins, plot=FALSE)$counts
+} 
+df1 <- data.frame(Case=rep(1:18, 10),
+  Means=c(mns),
+  Methods=rep(factor(mt, 
+              levels=mt,ordered=TRUE), each=18))
+df2 <- data.frame(Method=rep(1:10, each=10),
+                 Ranks=rep(10:1, 10),
+                 counts=c(tmp))
+df2$counts[df2$counts==0]=-1
+cat("Graph of Mean Power by Case\n")
+ggplot(data=df1, aes(Case, Means, color=Methods)) +
+  geom_point()  +
+  scale_x_continuous(breaks=1:21)
+cat("Graph of Ranks\n")
+ggplot(data=df2, aes(Method, Ranks)) +
+  geom_point(size=df2$counts) +
+  scale_x_continuous(breaks=1:10,labels = colnames(rnks)) +
+  scale_y_continuous(breaks=1:10) +
+ theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank())
+#ggsave("figResult1.pdf")
+```
+
+```{r}
+out <- matrix(0, 18, 10)
+colnames(out) <- c("RC", all.methods)
+rownames(out) <- 0:17
+for(i in 1:18) {
+  tmp <- readRDS(paste0("../simdata/case",i-1,".rds"))[[1]]
+  z <- apply(tmp, 1, max)
+  if(max(z)<90) next
+  tmp <- tmp[z>90, ,drop=FALSE]
+  z <- z[z>90]
+  if(nrow(tmp)>1) tmp <- tmp[order(z), ][1, 1:10]
+  else {tmp <- c(tmp)[1:10]}
+  out[i, ] <- tmp
+}
+out <- out[out[,1]>0,]
+mt <- apply(out, 2, mean)
+df2 <- data.frame(Method=rep(1:10, each=nrow(out)),
+                 Power=c(out))
+cat("Power of methods if best method has power of about 80%\n")
+ggplot(data=df2, aes(Method, Power)) +
+  geom_point() +
+  scale_x_continuous(breaks=1:10,labels = colnames(out))
+ggsave("figResult2.pdf")
+```
+
